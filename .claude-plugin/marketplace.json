@@ -133,6 +133,7 @@
         "./scientific-skills/openalex-database",
         "./scientific-skills/opentargets-database",
         "./scientific-skills/pdb-database",
+        "./scientific-skills/primekg",
         "./scientific-skills/pubchem-database",
         "./scientific-skills/pubmed-database",
         "./scientific-skills/reactome-database",
