@@ -19,7 +19,11 @@ PrimeKG is a precision medicine knowledge graph integrating 20+ biomedical datab
 - Retrieve direct neighbors with relationship type filtering
 - Get structured disease/drug/gene context summaries
 - Find paths between entities (e.g., drug → intermediate → disease for repurposing)
-- Enumerate all relationship and node types with counts
+- **Drug repurposing scoring** via metapath evidence (Himmelstein et al. 2017)
+- **Functional enrichment analysis** with hypergeometric ORA + BH FDR correction
+- **Hub gene identification** in disease-specific PPI modules (Menche et al. 2015)
+- **Disease-disease similarity** via multi-layer Jaccard (Goh et al. 2007)
+- **Subgraph extraction** for NetworkX/Cytoscape downstream analysis
 
 **Data access:** SQLite database at `$PRIMEKG_DATA_DIR/kg.sqlite` (default: `/mnt/c/Users/eamon/Documents/Data/PrimeKG/`). All queries use indexed SQL for fast lookups.
 
@@ -142,6 +146,104 @@ for nt in get_node_types():
     print(f"{nt['type']}: {nt['count']:,} nodes")
 ```
 
+## Network Analysis
+
+### 6. Drug Repurposing Scoring
+
+Computes metapath-based evidence for drug repurposing potential, inspired by
+Himmelstein et al. (eLife 2017) and Guney et al. (Nat Commun 2016). Returns
+shared targets, PPI bridges, shared pathways, indication analogs, and known
+status — all as separate transparent evidence components.
+
+```python
+from scripts.analysis import score_drug_repurposing
+
+result = score_drug_repurposing("Ibuprofen", "Parkinson")
+print(f"Shared targets: {result['shared_target_count']} (Jaccard={result['shared_target_jaccard']:.4f})")
+print(f"PPI bridges: {result['ppi_bridge_count']}")
+print(f"Shared pathways: {result['shared_pathway_count']}")
+print(f"Evidence lines: {result['evidence_lines']}/5")
+for st in result['shared_targets']:
+    print(f"  Target: {st['name']}")
+```
+
+### 7. Functional Enrichment Analysis
+
+Standard over-representation analysis (hypergeometric test + Benjamini-Hochberg
+FDR). Supports pathway, biological_process, molecular_function, cellular_component,
+disease, and phenotype categories.
+
+```python
+from scripts.analysis import enrichment_analysis
+
+# Pathway enrichment for PD genes
+result = enrichment_analysis(
+    gene_names=["LRRK2", "SNCA", "PRKN", "GBA", "PINK1", "VPS35"],
+    category="pathway",
+    fdr_threshold=0.05,
+)
+for term in result['results']:
+    print(f"{term['term_name']}: {term['overlap_count']} genes, "
+          f"FE={term['fold_enrichment']}x, q={term['q_value']:.2e}")
+
+# Biological process enrichment
+bp = enrichment_analysis(gene_names=["BRCA1", "TP53", "ATM"], category="biological_process")
+```
+
+### 8. Hub Gene Identification
+
+Builds the disease module (PPI subgraph among disease genes) and ranks by
+composite centrality: module degree, disease breadth, and druggability.
+
+```python
+from scripts.analysis import rank_hub_genes
+
+result = rank_hub_genes("Parkinson", top_n=10)
+print(f"Module: {result['module_stats']['n_genes']} genes, "
+      f"{result['module_stats']['n_edges']} PPI edges")
+for g in result['hub_genes']:
+    drug = " [DRUGGABLE]" if g['is_drug_target'] else ""
+    print(f"  {g['gene_name']}: deg={g['module_degree']}, "
+          f"diseases={g['disease_count']}, score={g['hub_score']:.3f}{drug}")
+```
+
+### 9. Disease Similarity
+
+Multi-layer Jaccard similarity across genes, phenotypes, drugs, exposures,
+and pathways. Includes hypergeometric p-value for gene overlap significance.
+
+```python
+from scripts.analysis import disease_similarity
+
+result = disease_similarity("Parkinson", "Alzheimer")
+print(f"Combined similarity: {result['combined_similarity']:.4f}")
+for layer, data in result['layers'].items():
+    print(f"  {layer}: Jaccard={data['jaccard']:.4f}, shared={data['shared_count']}")
+```
+
+### 10. Subgraph Extraction
+
+Extract induced subgraphs for downstream analysis in NetworkX, igraph, or
+Cytoscape. Supports 1-hop expansion and relation type filtering.
+
+```python
+from scripts.analysis import extract_subgraph
+
+# PPI subgraph for a gene set
+sg = extract_subgraph(
+    node_ids=["120892", "6622", "5071"],  # LRRK2, SNCA, PRKN
+    expand_hops=0,
+    relation_types=["protein_protein"],
+)
+print(f"Nodes: {sg['stats']['n_nodes']}, Edges: {sg['stats']['n_edges']}")
+
+# Convert to NetworkX
+import networkx as nx
+G = nx.Graph()
+for e in sg['edges']:
+    G.add_edge(e['source_name'], e['target_name'], relation=e['relation'])
+```
+
 ## Best Practices
 
 1. **Use `search_nodes` first** to get the correct node ID before calling `get_neighbors` or `find_paths`.
@@ -153,8 +255,15 @@ for nt in get_node_types():
 ## Resources
 
 ### Scripts
-- `scripts/query_primekg.py`: All query functions (SQLite-backed, indexed).
+- `scripts/query_primekg.py`: Search, neighbor lookup, context summaries, path finding.
+- `scripts/analysis.py`: Drug repurposing, enrichment, hub genes, disease similarity, subgraph extraction.
 
 ### References
 - [PrimeKG paper](https://doi.org/10.1038/s41597-023-01960-3) — Chandak et al., Scientific Data 2023
 - [GitHub](https://github.com/mims-harvard/PrimeKG) — Harvard MIMS
+- [Himmelstein et al. 2017](https://doi.org/10.7554/eLife.26726) — Metapath-based drug repurposing (eLife)
+- [Guney et al. 2016](https://doi.org/10.1038/ncomms10331) — Network proximity for drug efficacy (Nat Commun)
+- [Menche et al. 2015](https://doi.org/10.1126/science.1257601) — Disease modules in the interactome (Science)
+- [Goh et al. 2007](https://doi.org/10.1073/pnas.0701361104) — Human disease network (PNAS)
+- [Benjamini & Hochberg 1995](https://doi.org/10.1111/j.2517-6161.1995.tb02031.x) — FDR correction (JRSS-B)
+- [Boyle et al. 2004](https://doi.org/10.1093/bioinformatics/bth456) — GO::TermFinder enrichment (Bioinformatics)
