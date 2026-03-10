@@ -7,7 +7,6 @@ Falls back to CSV if SQLite is unavailable.
 import sqlite3
 import os
 from typing import List, Dict, Optional, Union
-from collections import deque
 
 # Data paths — SQLite preferred, CSV fallback
 _DATA_DIR = os.getenv(
@@ -42,6 +41,9 @@ def search_nodes(
 ) -> List[Dict]:
     """Search for nodes by name (case-insensitive substring match).
 
+    Results are ranked: exact matches first, then by edge count (most-connected
+    nodes are more useful and appear first).
+
     Args:
         name_query: Substring to search for in node names.
         node_type: Optional filter (e.g., 'gene/protein', 'drug', 'disease',
@@ -53,19 +55,40 @@ def search_nodes(
         List of dicts with keys: id, type, name, source.
     """
     conn = _get_conn()
+    # Fetch candidates (generous limit for re-ranking)
+    fetch_limit = max(limit * 5, 100)
     if node_type:
         rows = conn.execute(
             "SELECT id, type, name, source FROM nodes "
             "WHERE name LIKE ? AND type = ? LIMIT ?",
-            (f"%{name_query}%", node_type, limit),
+            (f"%{name_query}%", node_type, fetch_limit),
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT id, type, name, source FROM nodes "
             "WHERE name LIKE ? LIMIT ?",
-            (f"%{name_query}%", limit),
+            (f"%{name_query}%", fetch_limit),
         ).fetchall()
-    return [dict(r) for r in rows]
+
+    candidates = [dict(r) for r in rows]
+    if not candidates:
+        return []
+
+    # Rank by: (1) exact name match, (2) ID length as proxy for MONDO merge
+    # count (longer underscore-joined IDs = more DB entries merged = more
+    # canonical), (3) shorter name (more general term) as tiebreaker.
+    # This avoids expensive COUNT(*) on the 8M-row edges table.
+    query_lower = name_query.lower()
+    candidates.sort(
+        key=lambda c: (
+            c["name"].lower() == query_lower,   # exact match first
+            len(c["id"]),                        # longer merged IDs = more canonical
+            -len(c["name"]),                     # shorter name = more general
+        ),
+        reverse=True,
+    )
+
+    return candidates[:limit]
 
 
 def get_neighbors(
@@ -147,6 +170,9 @@ def find_paths(
 ) -> List[List[Dict]]:
     """Find shortest paths between two nodes via BFS (up to max_depth hops).
 
+    Uses (id, type) pairs to avoid false matches between nodes that share an
+    ID but have different types (e.g., gene "1234" vs anatomy "1234").
+
     Args:
         start_id: Source node ID.
         end_id: Target node ID.
@@ -176,45 +202,86 @@ def find_paths(
     if max_depth < 2 or len(paths) >= limit:
         return paths
 
-    # Depth 2: find shared intermediates
-    # Get neighbor IDs of start
-    start_neighbors = set()
+    # Depth 2: find shared intermediates using (id, type) pairs
+    start_neighbors: set[tuple[str, str]] = set()
     for row in conn.execute(
-        "SELECT y_id FROM edges WHERE x_id = ? "
-        "UNION SELECT x_id FROM edges WHERE y_id = ?",
+        "SELECT y_id, y_type FROM edges WHERE x_id = ? "
+        "UNION SELECT x_id, x_type FROM edges WHERE y_id = ?",
         (start_id, start_id),
     ).fetchall():
-        start_neighbors.add(row[0])
+        start_neighbors.add((row[0], row[1]))
 
-    # Get neighbor IDs of end
-    end_neighbors = set()
+    end_neighbors: set[tuple[str, str]] = set()
     for row in conn.execute(
-        "SELECT y_id FROM edges WHERE x_id = ? "
-        "UNION SELECT x_id FROM edges WHERE y_id = ?",
+        "SELECT y_id, y_type FROM edges WHERE x_id = ? "
+        "UNION SELECT x_id, x_type FROM edges WHERE y_id = ?",
         (end_id, end_id),
     ).fetchall():
-        end_neighbors.add(row[0])
+        end_neighbors.add((row[0], row[1]))
 
-    # Shared intermediates
-    intermediates = start_neighbors & end_neighbors
-    for mid_id in list(intermediates)[:limit - len(paths)]:
-        # Get edge start→mid
-        e1 = conn.execute(
-            "SELECT relation, display_relation, x_id, x_name, x_type, y_id, y_name, y_type "
-            "FROM edges WHERE (x_id = ? AND y_id = ?) OR (x_id = ? AND y_id = ?) LIMIT 1",
-            (start_id, mid_id, mid_id, start_id),
-        ).fetchone()
-        # Get edge mid→end
-        e2 = conn.execute(
-            "SELECT relation, display_relation, x_id, x_name, x_type, y_id, y_name, y_type "
-            "FROM edges WHERE (x_id = ? AND y_id = ?) OR (x_id = ? AND y_id = ?) LIMIT 1",
-            (mid_id, end_id, end_id, mid_id),
-        ).fetchone()
-        if e1 and e2:
-            paths.append([dict(e1), dict(e2)])
+    intermediates = list(start_neighbors & end_neighbors)
+    if not intermediates:
+        return paths
+
+    # Batch-fetch edges for all intermediates at once using temp table
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _mid(id TEXT, type TEXT)")
+    conn.execute("DELETE FROM _mid")
+    remaining = limit - len(paths)
+    conn.executemany(
+        "INSERT INTO _mid VALUES (?, ?)",
+        intermediates[:remaining * 3],  # overfetch slightly
+    )
+
+    # Edges from start to intermediates
+    e1_rows = conn.execute(
+        "SELECT e.relation, e.display_relation, e.x_id, e.x_name, e.x_type, "
+        "       e.y_id, e.y_name, e.y_type "
+        "FROM edges e JOIN _mid m ON "
+        "  ((e.x_id = ? AND e.y_id = m.id AND e.y_type = m.type) OR "
+        "   (e.y_id = ? AND e.x_id = m.id AND e.x_type = m.type))",
+        (start_id, start_id),
+    ).fetchall()
+
+    # Index by (mid_id, mid_type) -> first edge
+    e1_by_mid: dict[tuple[str, str], dict] = {}
+    for row in e1_rows:
+        d = dict(row)
+        # Determine which side is the intermediate
+        if d["x_id"] == start_id:
+            key = (d["y_id"], d["y_type"])
+        else:
+            key = (d["x_id"], d["x_type"])
+        if key not in e1_by_mid:
+            e1_by_mid[key] = d
+
+    # Edges from intermediates to end
+    e2_rows = conn.execute(
+        "SELECT e.relation, e.display_relation, e.x_id, e.x_name, e.x_type, "
+        "       e.y_id, e.y_name, e.y_type "
+        "FROM edges e JOIN _mid m ON "
+        "  ((e.y_id = ? AND e.x_id = m.id AND e.x_type = m.type) OR "
+        "   (e.x_id = ? AND e.y_id = m.id AND e.y_type = m.type))",
+        (end_id, end_id),
+    ).fetchall()
+
+    e2_by_mid: dict[tuple[str, str], dict] = {}
+    for row in e2_rows:
+        d = dict(row)
+        if d["y_id"] == end_id:
+            key = (d["x_id"], d["x_type"])
+        else:
+            key = (d["y_id"], d["y_type"])
+        if key not in e2_by_mid:
+            e2_by_mid[key] = d
+
+    # Assemble paths
+    for mid_key in intermediates:
+        if mid_key in e1_by_mid and mid_key in e2_by_mid:
+            paths.append([e1_by_mid[mid_key], e2_by_mid[mid_key]])
             if len(paths) >= limit:
                 break
 
+    conn.execute("DROP TABLE IF EXISTS _mid")
     return paths
 
 
@@ -232,6 +299,7 @@ def get_disease_context(disease_name: str) -> Dict:
     if not results:
         return {"error": f"Disease '{disease_name}' not found"}
 
+    # search_nodes already ranks by edge count, so first result is best
     disease = results[0]
     neighbors = get_neighbors(disease["id"], limit=2000)
 
